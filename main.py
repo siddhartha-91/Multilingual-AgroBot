@@ -1,89 +1,110 @@
 # ==============================================================================
-# FINAL STRATEGY: NATIVE FP16 LOADING (Bypassing BitsAndBytes)
+# FINAL WORKING STRATEGY: NATIVE FP16 QWEN-VL LOADING WITHOUT BITSANDBYTES
 # ==============================================================================
 
 import os
 
-# [SECTION 1] CLEAN INSTALL
-print("⏳ Installing Dependencies (No Quantization)...")
-# We DO NOT install bitsandbytes. We don't need it anymore.
-os.system("pip uninstall -y transformers peft bitsandbytes accelerate")
-os.system("pip install -q transformers==4.37.2") 
-os.system("pip install -q peft==0.8.2") 
-os.system("pip install -q accelerate==0.27.2")
+print("⏳ Installing dependencies...")
+os.system("pip uninstall -y bitsandbytes")
+os.system("pip install -q transformers==4.37.2 peft==0.8.2 accelerate==0.27.2")
 os.system("pip install -q tiktoken einops scipy datasets huggingface_hub")
-print("✅ Installation Complete.")
+print("✅ Installation done.")
 
-# [SECTION 2] DOWNLOAD & PATCH QWEN
+# ------------------------------------------------------------------------------
+# DOWNLOAD MODEL
+# ------------------------------------------------------------------------------
 from huggingface_hub import snapshot_download
+import json
 import glob
 
 MODEL_ID = "Qwen/Qwen-VL-Chat"
-print(f"⬇️ Downloading {MODEL_ID}...")
+print(f"⬇️ Downloading: {MODEL_ID}")
+
 download_path = snapshot_download(
-    repo_id=MODEL_ID, 
-    allow_patterns=["*.py", "*.json", "*.bin", "*.model", "*.tiktoken"]
+    repo_id=MODEL_ID,
+    allow_patterns=["*.json", "*.py", "*.bin", "*.model", "*.tiktoken"]
 )
 
-print("🔧 Patching Qwen Code...")
-py_files = glob.glob(os.path.join(download_path, "*.py"))
+# ------------------------------------------------------------------------------
+# PATCH TOKENIZER + STREAMING ERRORS
+# ------------------------------------------------------------------------------
+print("🔧 Applying necessary patches...")
 
-for file_path in py_files:
-    with open(file_path, "r") as f: code = f.read()
-    
+# ---- Patch 1: Remove streaming dependency (ALL .py files) ----
+for file_path in glob.glob(download_path + "/*.py"):
+    with open(file_path, "r") as f:
+        code = f.read()
+
     modified = False
-    # Remove streaming dependency
+
     if "transformers_stream_generator" in code:
-        code = code.replace("from transformers_stream_generator", "# from transformers_stream_generator")
-        code = code.replace("import transformers_stream_generator", "# import transformers_stream_generator")
-        code = code.replace("init_stream_support", "# init_stream_support")
+        code = code.replace("transformers_stream_generator", "# transformers_stream_generator")
         modified = True
-    
-    # Remove IMAGE_ST crash
-    if "self.IMAGE_ST" in code:
-        code = code.replace("if surface_form not in SPECIAL_TOKENS + self.IMAGE_ST:", "if False: # Patched")
-        code = code.replace("raise ValueError('Adding unknown special tokens is not supported')", "pass")
-        modified = True
-        
+
     if modified:
-        with open(file_path, "w") as f: f.write(code)
-        print(f"   -> Fixed {os.path.basename(file_path)}")
+        with open(file_path, "w") as f:
+            f.write(code)
+        print("✔️ Patched:", os.path.basename(file_path))
 
-print("✅ Code Patched.")
+# ---- Patch 2: Fix IMAGE_ST crash inside tokenizer_config.json ----
+tok_cfg = f"{download_path}/tokenizer_config.json"
 
-# [SECTION 3] LOAD MODEL (FP16 Mode)
+with open(tok_cfg, "r") as f:
+    data = json.load(f)
+
+if "image_start_token" in data:
+    print("✔️ Removing IMAGE_ST from tokenizer config...")
+    data["image_start_token"] = ""        # prevents crash
+    data["image_end_token"] = ""
+
+with open(tok_cfg, "w") as f:
+    json.dump(data, f, indent=2)
+
+print("✅ All patches applied.")
+
+# ------------------------------------------------------------------------------
+# LOAD MODEL FP16
+# ------------------------------------------------------------------------------
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from peft import LoraConfig, get_peft_model
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
-print("⬇️ Loading Model (Distributed FP16)...")
-
-# Load Tokenizer
+print("⬇️ Loading tokenizer...")
 tokenizer = AutoTokenizer.from_pretrained(
-    download_path, 
-    trust_remote_code=True, 
-    pad_token='<|endoftext|>'
+    download_path,
+    trust_remote_code=True,
+    pad_token="<|endoftext|>"
 )
 
-# Load Model
-# Notice: No 'quantization_config'. We use torch_dtype=torch.float16
+print("⬇️ Loading model in FP16 (multi-GPU)...")
 model = AutoModelForCausalLM.from_pretrained(
     download_path,
-    device_map="auto",              # Splits the 15GB model across 2 GPUs
-    trust_remote_code=True,
-    torch_dtype=torch.float16,      # Standard Half-Precision
-    fp16=True
+    torch_dtype=torch.float16,  # correct
+    device_map="auto",
+    trust_remote_code=True
 )
 
-# LoRA
+# ------------------------------------------------------------------------------
+# APPLY LoRA
+# ------------------------------------------------------------------------------
+print("💉 Injecting LoRA modules...")
+
+from peft import LoraConfig, get_peft_model
+
+# Correct Qwen-VL modules
 lora_config = LoraConfig(
-    r=16, lora_alpha=32,
-    target_modules=["c_attn", "attn.c_proj", "w1", "w2", "visual.conv1", "visual.attn.in_proj"],
-    lora_dropout=0.05, bias="none", task_type="CAUSAL_LM"
+    r=16,
+    lora_alpha=32,
+    target_modules=[
+        "mlp.w1", "mlp.w2",         # feedforward
+        "attention.wqkv", "attention.wo",   # attention layers
+        "visual.attn.qkv", "visual.attn.proj",  # vision tower LoRA
+    ],
+    lora_dropout=0.05,
+    bias="none",
+    task_type="CAUSAL_LM"
 )
 
-print("💉 Injecting LoRA Adapters...")
 model = get_peft_model(model, lora_config)
 model.print_trainable_parameters()
 
-print("\n🚀 SUCCESS! The Model is ALIVE (Native FP16 Mode).")
+print("\n🚀 MODEL SUCCESSFULLY LOADED IN NATIVE FP16 + LORA READY!")
