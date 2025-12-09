@@ -1,0 +1,13 @@
+.app { max-width:600px; margin:auto; font-family:Arial }
+button { margin:10px; padding:8px 15px; }
+.card, .chat {
+  background:#e9fff1;
+  padding:15px;
+  border-radius:10px;
+  margin-top:15px;
+}
+.reply {
+  background:white;
+  padding:10px;
+  margin-top:10px;
+}
